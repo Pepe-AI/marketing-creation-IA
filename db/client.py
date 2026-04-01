@@ -37,10 +37,10 @@ class DatabaseClient:
     async def connect(self):
         """Crea el pool de conexiones."""
         self._pool = await asyncpg.create_pool(
-            self.database_url,
-            min_size=2,
+            dsn=self.database_url,
+            ssl='require',
+            min_size=1,
             max_size=10,
-            command_timeout=60,
         )
         logger.info("Pool de conexiones PostgreSQL creado")
 

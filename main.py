@@ -110,6 +110,18 @@ async def health():
     return {"status": "ok", "service": "ecosfera-pipeline", "version": "1.0.0"}
 
 
+@app.get("/health/db")
+async def health_db():
+    """Verifica conexión a PostgreSQL y lista las tablas públicas."""
+    async with db._pool.acquire() as conn:
+        await conn.fetchval("SELECT 1")
+        rows = await conn.fetch(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' ORDER BY table_name"
+        )
+    return {"db": "ok", "tables": [r["table_name"] for r in rows]}
+
+
 @app.get("/pipeline/{cliente_id}")
 async def pipeline_status(cliente_id: str):
     """Consulta el estado del pipeline de un cliente."""
@@ -182,6 +194,7 @@ async def ejecutar_pipeline(cliente_id: str):
         await cache.set_pipeline_status(cliente_id, "procesando", paso=1, detalle="Ejecutando Paralelo A")
 
         # 3. Paralelo A: procesar_transcript + analizar_competidores
+        # competidores es [{"nombre": "X"}, ...] — extraer solo los nombres
         competidores_lista = []
         if datos_form:
             comp = datos_form.get("competidores", [])
@@ -190,7 +203,14 @@ async def ejecutar_pipeline(cliente_id: str):
                     comp = json.loads(comp)
                 except json.JSONDecodeError:
                     comp = []
-            competidores_lista = comp if isinstance(comp, list) else []
+            if isinstance(comp, list):
+                for c in comp:
+                    if isinstance(c, dict):
+                        nombre = c.get("nombre", "")
+                        if nombre:
+                            competidores_lista.append(nombre)
+                    elif isinstance(c, str):
+                        competidores_lista.append(c)
 
         transcript_task = procesar_transcript(cliente_id, transcript_raw)
         competitors_task = analizar_competidores(cliente_id, competidores_lista, cache)

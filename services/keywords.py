@@ -3,7 +3,9 @@ services/keywords.py — Etapa 3.3 + 3.4: Keyword Research (SerpAPI + Keyword Pl
 """
 
 import os
+import re
 import json
+import asyncio
 import logging
 from typing import Optional
 
@@ -35,8 +37,12 @@ async def researchar_keywords(
     pool = await _construir_pool_keywords(keywords_base, keywords_transcript, datos_form)
     logger.info(f"Pool de keywords construido: {len(pool)} keywords únicas")
 
-    # 3.3 — SerpAPI por keyword
-    for keyword in pool:
+    # 3.3 — SerpAPI por keyword (cada _buscar_serp llama a Gemini para clasificar tipo_contenido)
+    for i, keyword in enumerate(pool):
+        # TEMPORAL — PLAN FREE GEMINI: borrar toda la lógica del delay
+        # una vez se actualice al plan de pago de Gemini API.
+        if i > 0:
+            await asyncio.sleep(1.5)
         try:
             await _buscar_serp(cliente_id, keyword, db, cache)
         except Exception as e:
@@ -114,9 +120,56 @@ async def _construir_pool_keywords(
         if isinstance(kw, str):
             pool.add(kw.strip().lower())
 
-    # Filtrar vacíos y limitar a 20
+    # Filtrar vacíos, limpiar y limitar a 20
     pool = [kw for kw in pool if kw]
+    pool = _limpiar_keywords(pool)
     return pool[:20]
+
+
+_LETRAS_ES = re.compile(r'[a-záéíóúñü]', re.IGNORECASE)
+
+
+def _limpiar_keywords(pool: list[str]) -> list[str]:
+    """
+    Filtra keywords inválidas usando regex y lógica determinista.
+    Sin llamadas a APIs externas.
+    """
+    n_original = len(pool)
+    resultado = []
+    vistos = set()
+
+    for kw in pool:
+        kw = kw.strip()
+
+        # REGLA 1 — Longitud mínima: 4 caracteres
+        if len(kw) < 4:
+            continue
+
+        # REGLA 2 — Mínimo 2 letras del alfabeto español
+        letras = _LETRAS_ES.findall(kw)
+        if len(letras) < 2:
+            continue
+
+        # REGLA 3 — Letras deben ser al menos 60% del total
+        if len(letras) / len(kw) < 0.6:
+            continue
+
+        # REGLA 4 — Deduplicación case-insensitive
+        clave = kw.lower()
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+
+        resultado.append(kw)
+
+    descartadas = n_original - len(resultado)
+    if descartadas > 0:
+        logger.info(
+            f"Pool de keywords: {n_original} candidatas → "
+            f"{len(resultado)} válidas tras filtrado"
+        )
+
+    return resultado
 
 
 async def _buscar_serp(
@@ -152,8 +205,11 @@ async def _buscar_serp(
         data = resp.json()
 
     # Extraer datos relevantes
+    organicos = data.get("organic_results", [])[:10]
+    tipo_contenido = await _detectar_tipo_contenido(keyword, organicos)
+
     datos = {
-        "resultados_organicos": data.get("organic_results", [])[:10],
+        "resultados_organicos": organicos,
         "anuncios_encontrados": data.get("ads", [])[:5],
         "people_also_ask": data.get("related_questions", [])[:5],
         "busquedas_relacionadas": [
@@ -162,7 +218,7 @@ async def _buscar_serp(
         "sugerencias_autocomplete": [
             s.get("value", "") for s in data.get("suggestions", [])[:10]
         ],
-        "tipo_contenido_posiciona": _detectar_tipo_contenido(data.get("organic_results", [])),
+        "tipo_contenido_posiciona": tipo_contenido,
     }
 
     # Guardar en cache y DB
@@ -171,25 +227,77 @@ async def _buscar_serp(
     logger.info(f"SerpAPI completado para '{keyword}'")
 
 
-def _detectar_tipo_contenido(organic_results: list) -> str:
-    """Detecta el tipo de contenido que posiciona mejor basado en los resultados."""
+async def _buscar_serp_solo(keyword: str, cache: RedisClient) -> Optional[dict]:
+    """Busca en SerpAPI y guarda en cache. No toca DB — para scripts de test."""
+    serpapi_key = os.environ.get("SERPAPI_KEY")
+    if not serpapi_key:
+        logger.warning("SERPAPI_KEY no configurada")
+        return None
+
+    params = {
+        "q": keyword,
+        "api_key": serpapi_key,
+        "hl": "es",
+        "gl": "mx",
+        "num": 10,
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get("https://serpapi.com/search.json", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    organicos = data.get("organic_results", [])[:10]
+    tipo_contenido = await _detectar_tipo_contenido(keyword, organicos)
+
+    datos = {
+        "resultados_organicos": organicos,
+        "anuncios_encontrados": data.get("ads", [])[:5],
+        "people_also_ask": data.get("related_questions", [])[:5],
+        "busquedas_relacionadas": [
+            r.get("query", "") for r in data.get("related_searches", [])[:10]
+        ],
+        "sugerencias_autocomplete": [
+            s.get("value", "") for s in data.get("suggestions", [])[:10]
+        ],
+        "tipo_contenido_posiciona": tipo_contenido,
+    }
+
+    await cache.set_serp(keyword, datos)
+    return datos
+
+
+async def _detectar_tipo_contenido(keyword: str, organic_results: list) -> str:
+    """Clasifica el tipo de contenido dominante usando Gemini."""
     if not organic_results:
         return "desconocido"
 
-    tipos = {"blog": 0, "ecommerce": 0, "video": 0, "directorio": 0, "otro": 0}
-    for r in organic_results[:5]:
-        link = r.get("link", "").lower()
-        snippet = r.get("snippet", "").lower()
-        if "youtube.com" in link or "video" in snippet:
-            tipos["video"] += 1
-        elif any(kw in link for kw in ["/blog", "/articulo", "/post"]):
-            tipos["blog"] += 1
-        elif any(kw in link for kw in ["/product", "/shop", "/tienda", "mercadolibre"]):
-            tipos["ecommerce"] += 1
-        else:
-            tipos["otro"] += 1
+    # Construir lista de títulos + URLs para el prompt
+    resultados_texto = "\n".join(
+        f"- {r.get('title', 'Sin título')} | {r.get('link', '')}"
+        for r in organic_results[:5]
+    )
 
-    return max(tipos, key=tipos.get)
+    try:
+        ai = AIProvider()
+        respuesta = await ai.generate(
+            system_prompt="Eres un analista SEO experto. Responde con una sola palabra o frase corta.",
+            context="",
+            instruction=(
+                f'Dados estos resultados de búsqueda de Google para la keyword "{keyword}":\n'
+                f"{resultados_texto}\n\n"
+                "Clasifica en UNA sola palabra o frase corta qué tipo de contenido "
+                "domina los resultados. Ejemplos posibles: \"agencia_servicios\", "
+                "\"ecommerce\", \"blog_informativo\", \"directorio\", \"red_social\", "
+                "\"noticias\", \"gobierno\", \"educativo\", \"marketplace\".\n\n"
+                "Responde SOLO con la clasificación, sin explicación ni texto extra."
+            ),
+            timeout=10,
+        )
+        return respuesta.strip().strip('"').lower()
+    except Exception as e:
+        logger.warning(f"Error clasificando tipo de contenido para '{keyword}': {e}")
+        return "no_clasificado"
 
 
 async def _keyword_planner(

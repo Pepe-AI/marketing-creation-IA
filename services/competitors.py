@@ -53,7 +53,7 @@ async def analizar_competidores(
             logger.warning(f"Error analizando competidor '{nombre}': {e}")
             resultados.append(_resultado_vacio(nombre))
 
-    # Paso D: Síntesis cruzada (solo si hay competidores con datos)
+    # Paso D: Síntesis cruzada (NO CRÍTICO — solo si hay competidores con datos)
     competidores_con_datos = [r for r in resultados if r.get("cantidad_anuncios", 0) > 0]
     if competidores_con_datos:
         try:
@@ -62,6 +62,8 @@ async def analizar_competidores(
                 r["oportunidades_detectadas"] = sintesis
         except Exception as e:
             logger.warning(f"Error en síntesis cruzada: {e}")
+            for r in resultados:
+                r["oportunidades_detectadas"] = "Síntesis cruzada no disponible — reintenta el pipeline"
 
     logger.info(f"Análisis de competidores completado para cliente={cliente_id}")
     return resultados
@@ -106,8 +108,9 @@ async def _analizar_un_competidor(nombre: str, cache: RedisClient) -> dict:
     resultado["cantidad_anuncios"] = len(anuncios)
     resultado["anuncios_raw"] = anuncios[:50]  # Limitar a 50
 
-    # Extraer creativos, copies, formatos y plataformas
+    # Extraer creativos, copies, formatos, plataformas y contextos de texto
     creativos_urls = []
+    ad_contexts = []  # Contexto de texto completo por anuncio para Gemini
     copies = []
     formatos = set()
     plataformas = set()
@@ -136,21 +139,8 @@ async def _analizar_un_competidor(nombre: str, cache: RedisClient) -> dict:
         if isinstance(platforms, list):
             plataformas.update(platforms)
 
-        # URLs de creativos (imágenes y videos)
-        creative_url = None
-        images = snapshot.get("images", [])
-        videos = snapshot.get("videos", [])
-
-        if videos and isinstance(videos, list):
-            video = videos[0]
-            if isinstance(video, dict):
-                creative_url = video.get("video_hd_url") or video.get("video_sd_url")
-        elif images and isinstance(images, list):
-            img = images[0]
-            if isinstance(img, dict):
-                creative_url = img.get("original_image_url") or img.get("resized_image_url")
-            elif isinstance(img, str):
-                creative_url = img
+        # Extraer URL del creativo (preview image, nunca video directo)
+        creative_url = _extraer_creative_url(snapshot)
 
         if creative_url:
             creativos_urls.append(creative_url)
@@ -160,6 +150,9 @@ async def _analizar_un_competidor(nombre: str, cache: RedisClient) -> dict:
                 "cta": snapshot.get("cta_text"),
                 "title": snapshot.get("title"),
             })
+
+            # Construir contexto de texto completo para Gemini
+            ad_contexts.append(_construir_contexto_texto(ad, snapshot, copy_text))
 
     resultado["creativos_urls"] = creativos_urls
     resultado["copies"] = copies
@@ -174,11 +167,11 @@ async def _analizar_un_competidor(nombre: str, cache: RedisClient) -> dict:
             "ultimo_anuncio": anuncios[0].get("start_date_formatted", ""),
         }
 
-    # Paso C: Análisis Gemini Vision por anuncio
-    analisis_anuncios = await _analizar_anuncios_gemini(creativos_urls[:50], copies[:50], cache)
+    # Paso C: Análisis Gemini Vision por anuncio (con contexto de texto completo)
+    analisis_anuncios = await _analizar_anuncios_gemini(creativos_urls[:50], ad_contexts[:50], cache)
     resultado["analisis_por_anuncio"] = analisis_anuncios
 
-    # Paso D: Síntesis por competidor
+    # Paso D: Síntesis por competidor (NO CRÍTICO)
     if analisis_anuncios:
         try:
             sintesis = await _sintesis_competidor(nombre, analisis_anuncios)
@@ -186,6 +179,8 @@ async def _analizar_un_competidor(nombre: str, cache: RedisClient) -> dict:
             resultado["sintesis_competitiva"] = sintesis
         except Exception as e:
             logger.warning(f"Error en síntesis para '{nombre}': {e}")
+            resultado["patrones_messaging"] = "Síntesis no disponible — reintenta el pipeline"
+            resultado["sintesis_competitiva"] = "Síntesis no disponible — reintenta el pipeline"
 
     return resultado
 
@@ -258,16 +253,18 @@ async def _scraping_apify(facebook_url: str, cache: RedisClient) -> Optional[lis
 
     # Construir input del actor según schema real confirmado
     actor_input = {
-        "urls": [facebook_url],
-        "limitPerSource": 50,
+        "urls": [{"url": facebook_url}],
+        "limitPerSource": 10,
+        "count": 10,
         "scrapePageAds.activeStatus": "active",
         "scrapePageAds.countryCode": "MX",
     }
 
     try:
+        actor_id_url = actor_id.replace("/", "~")
         async with httpx.AsyncClient(timeout=30) as client:
             # Iniciar run
-            run_url = f"https://api.apify.com/v2/acts/{actor_id}/runs?token={apify_token}"
+            run_url = f"https://api.apify.com/v2/acts/{actor_id_url}/runs?token={apify_token}"
             resp = await client.post(run_url, json=actor_input)
             resp.raise_for_status()
             run_data = resp.json().get("data", {})
@@ -330,10 +327,103 @@ async def _poll_apify_run(run_id: str, token: str, timeout: int = 300) -> Option
 
 
 # =====================================================================
+# HELPERS: Extracción de creativos y contexto de texto
+# =====================================================================
+
+def _extraer_creative_url(snapshot: dict) -> Optional[str]:
+    """
+    Extrae la URL de imagen del creativo. Prioriza preview images sobre videos.
+    Gemini no puede procesar video directo — usamos el thumbnail.
+    """
+    cards = snapshot.get("cards", [])
+    images = snapshot.get("images", [])
+    videos = snapshot.get("videos", [])
+
+    # 1. Cards (carruseles) — usar preview image del video o imagen del card
+    if cards and isinstance(cards, list):
+        card = cards[0]
+        if isinstance(card, dict):
+            url = (
+                card.get("video_preview_image_url")
+                or card.get("original_image_url")
+                or card.get("resized_image_url")
+            )
+            if url:
+                return url
+
+    # 2. Videos — usar preview image, nunca video directo
+    if videos and isinstance(videos, list):
+        video = videos[0]
+        if isinstance(video, dict):
+            url = video.get("video_preview_image_url")
+            if url:
+                return url
+
+    # 3. Imágenes directas
+    if images and isinstance(images, list):
+        img = images[0]
+        if isinstance(img, dict):
+            return img.get("original_image_url") or img.get("resized_image_url")
+        elif isinstance(img, str):
+            return img
+
+    return None
+
+
+def _construir_contexto_texto(ad: dict, snapshot: dict, copy_text: str) -> dict:
+    """Construye un dict con todos los campos de texto disponibles del anuncio."""
+    def _limpiar(valor):
+        """Descarta placeholders dinámicos tipo {{product.x}}."""
+        if not valor or not isinstance(valor, str):
+            return None
+        if "{{" in valor and "}}" in valor:
+            return None
+        return valor.strip() or None
+
+    contexto = {}
+
+    # Campos del snapshot
+    if _limpiar(copy_text):
+        contexto["copy"] = copy_text
+    if _limpiar(snapshot.get("caption")):
+        contexto["caption"] = snapshot["caption"]
+    if _limpiar(snapshot.get("cta_text")):
+        contexto["cta"] = snapshot["cta_text"]
+    if _limpiar(snapshot.get("page_name")):
+        contexto["page_name"] = snapshot["page_name"]
+    if _limpiar(snapshot.get("title")):
+        contexto["title"] = snapshot["title"]
+    if _limpiar(snapshot.get("link_description")):
+        contexto["link_description"] = snapshot["link_description"]
+
+    # Campos del primer card si existe
+    cards = snapshot.get("cards", [])
+    if cards and isinstance(cards, list) and isinstance(cards[0], dict):
+        card = cards[0]
+        if _limpiar(card.get("caption")):
+            contexto["card_caption"] = card["caption"]
+        if _limpiar(card.get("title")):
+            contexto["card_title"] = card["title"]
+
+    # Campos del anuncio (top-level)
+    platforms = ad.get("publisher_platform", [])
+    if platforms:
+        contexto["plataformas"] = platforms if isinstance(platforms, list) else [platforms]
+    if ad.get("start_date_formatted"):
+        contexto["fecha_inicio"] = ad["start_date_formatted"]
+    if ad.get("end_date_formatted"):
+        contexto["fecha_fin"] = ad["end_date_formatted"]
+
+    return contexto
+
+
+# =====================================================================
 # PASO C: Análisis Gemini Vision por anuncio
 # =====================================================================
 
-AD_ANALYSIS_PROMPT = """Analiza este anuncio de Facebook/Instagram.
+AD_ANALYSIS_PROMPT = """Analiza la imagen del thumbnail y el contexto de texto disponible de este anuncio de Facebook/Instagram.
+Si el copy es un placeholder dinámico ({{product.x}}), ignóralo y basa el análisis en la imagen y los demás campos disponibles.
+
 Responde SOLO con JSON válido, sin markdown, sin texto extra:
 {
   "hook": "elemento o frase que capta la atención inicial",
@@ -347,7 +437,7 @@ Responde SOLO con JSON válido, sin markdown, sin texto extra:
 
 async def _analizar_anuncios_gemini(
     creativos_urls: list[str],
-    copies: list[str],
+    ad_contexts: list[dict],
     cache: RedisClient,
 ) -> list[dict]:
     """Analiza cada anuncio con Gemini. Usa cache por URL de creativo."""
@@ -361,9 +451,18 @@ async def _analizar_anuncios_gemini(
             resultados.append(cached)
             continue
 
-        # Construir contexto con el copy del anuncio si disponible
-        copy_text = copies[i] if i < len(copies) else "No disponible"
-        context = f"Copy del anuncio: {copy_text}\nURL del creativo: {creative_url}"
+        # TEMPORAL — PLAN FREE GEMINI: borrar toda la lógica del delay
+        # una vez se actualice al plan de pago de Gemini API.
+        # El plan de pago no tiene límite de 10 req/min.
+        if i > 0:
+            await asyncio.sleep(1.5)
+
+        # Construir contexto con todos los campos de texto disponibles
+        ctx = ad_contexts[i] if i < len(ad_contexts) else {}
+        context = (
+            f"Contexto del anuncio:\n{json.dumps(ctx, ensure_ascii=False, indent=1)}\n\n"
+            f"URL de la imagen del creativo: {creative_url}"
+        )
 
         try:
             response_text = await ai.generate(

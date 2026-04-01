@@ -16,6 +16,9 @@ import sys
 import json
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
