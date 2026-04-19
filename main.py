@@ -24,7 +24,7 @@ from db.client import DatabaseClient
 from cache.redis_client import RedisClient
 from services.transcript import procesar_transcript
 from services.competitors import analizar_competidores
-from services.keywords import researchar_keywords
+from services.keywords import researchar_keywords, gemini_batch_keywords, keyword_volumes_kwp
 from services.consolidator import consolidar
 from services.methodology import generar_metodologia
 from services.document import crear_documento
@@ -193,7 +193,7 @@ async def ejecutar_pipeline(cliente_id: str):
         await db.actualizar_estado_pipeline(cliente_id, "procesando")
         await cache.set_pipeline_status(cliente_id, "procesando", paso=1, detalle="Ejecutando Paralelo A")
 
-        # 3. Paralelo A: procesar_transcript + analizar_competidores
+        # 3. PARALELO A: procesar_transcript + analizar_competidores
         # competidores es [{"nombre": "X"}, ...] — extraer solo los nombres
         competidores_lista = []
         if datos_form:
@@ -212,37 +212,16 @@ async def ejecutar_pipeline(cliente_id: str):
                     elif isinstance(c, str):
                         competidores_lista.append(c)
 
-        transcript_task = procesar_transcript(cliente_id, transcript_raw)
-        competitors_task = analizar_competidores(cliente_id, competidores_lista, cache)
+        # Lanzar ambas tareas como tasks — transcript es crítico, competidores sigue en background
+        transcript_task = asyncio.create_task(procesar_transcript(cliente_id, transcript_raw))
+        competitors_task = asyncio.create_task(analizar_competidores(cliente_id, competidores_lista, cache))
 
-        analisis_result, competidores_result = await asyncio.gather(
-            transcript_task,
-            competitors_task,
-            return_exceptions=True,
-        )
-
-        # Verificar resultado del transcript (CRÍTICO)
-        if isinstance(analisis_result, Exception):
-            raise analisis_result
+        # Esperar transcript (CRÍTICO) — competidores continúa en background
+        analisis_result = await transcript_task
 
         # Guardar análisis de transcript en DB
         await db.guardar_analisis_transcript(cliente_id, analisis_result)
         await cache.set_pipeline_status(cliente_id, "procesando", paso=2, detalle="Transcript procesado")
-
-        # Guardar competidores (no crítico)
-        if isinstance(competidores_result, Exception):
-            logger.warning(f"Análisis de competidores falló: {competidores_result}")
-            competidores_result = []
-        else:
-            for comp_data in competidores_result:
-                try:
-                    await db.guardar_analisis_competidor(
-                        cliente_id,
-                        comp_data["competidor_nombre"],
-                        comp_data,
-                    )
-                except Exception as e:
-                    logger.warning(f"Error guardando competidor '{comp_data.get('competidor_nombre')}': {e}")
 
         # 4. Extraer keywords del transcript para Paralelo B
         keywords_transcript = analisis_result.get("keywords_mencionadas", [])
@@ -262,38 +241,75 @@ async def ejecutar_pipeline(cliente_id: str):
                     if nombre:
                         keywords_base.append(nombre)
 
-        # 5. Paralelo B: keyword_search + keyword_volumes (ambos dentro de researchar_keywords)
+        # 5. PARALELO B: SerpAPI (3.3a) + pytrends (3.3b) por keyword
         await cache.set_pipeline_status(cliente_id, "procesando", paso=3, detalle="Ejecutando keyword research")
 
+        kw_result = {"pool": [], "serp_results": {}, "pytrends_results": {}, "pytrends_available": False}
         try:
-            await researchar_keywords(
+            kw_result = await researchar_keywords(
                 cliente_id, keywords_base, keywords_transcript,
                 datos_form or {}, db, cache,
             )
         except Exception as e:
             logger.warning(f"Keyword research falló (no crítico): {e}")
 
+        # 6. Esperar competidores (asegurar que Paralelo A esté completo)
+        try:
+            competidores_result = await competitors_task
+        except Exception as e:
+            logger.warning(f"Análisis de competidores falló: {e}")
+            competidores_result = []
+
+        # Guardar competidores en DB (no crítico)
+        if isinstance(competidores_result, list):
+            for comp_data in competidores_result:
+                try:
+                    await db.guardar_analisis_competidor(
+                        cliente_id,
+                        comp_data["competidor_nombre"],
+                        comp_data,
+                    )
+                except Exception as e:
+                    logger.warning(f"Error guardando competidor '{comp_data.get('competidor_nombre')}': {e}")
+
+        # 7. SECUENCIAL: Gemini batch keyword analysis (3.3c)
+        # Espera a que 3.2 (competidores) y 3.3a/b (SerpAPI + pytrends) estén completos
+        # para evitar errores 429 de Gemini en plan gratuito
+        await cache.set_pipeline_status(cliente_id, "procesando", paso=4, detalle="Analizando keywords con Gemini")
+
+        try:
+            await gemini_batch_keywords(
+                cliente_id,
+                kw_result["pool"],
+                kw_result["serp_results"],
+                kw_result["pytrends_results"],
+                kw_result["pytrends_available"],
+                db, cache,
+            )
+        except Exception as e:
+            logger.warning(f"Gemini batch keywords falló (no crítico): {e}")
+
+        # 8. CONDICIONAL: Keyword Planner (3.4 — skip silencioso si no configurado)
+        try:
+            await keyword_volumes_kwp(cliente_id, kw_result["pool"], db, cache)
+        except Exception as e:
+            logger.warning(f"Keyword Planner falló (no crítico): {e}")
+
         # 6. Consolidar (placeholder)
         await cache.set_pipeline_status(cliente_id, "procesando", paso=5, detalle="Consolidando datos")
-        contexto = await consolidar(cliente_id)
+        contexto = await consolidar(cliente_id, db, cache)
 
         # 7. Generar metodología (placeholder)
         await cache.set_pipeline_status(cliente_id, "procesando", paso=6, detalle="Generando metodología")
-        metodologia = await generar_metodologia(cliente_id, contexto)
+        metodologia = await generar_metodologia(cliente_id, contexto, db)
 
-        # 8. Crear documento (placeholder)
-        await cache.set_pipeline_status(cliente_id, "procesando", paso=7, detalle="Creando documento")
-        documento_url = await crear_documento(cliente_id, metodologia)
+        # 8. Crear documento en Google Drive + notificación Telegram
+        await cache.set_pipeline_status(cliente_id, "procesando", paso=7, detalle="Creando documento en Drive")
+        documento_url = await crear_documento(cliente_id, metodologia, db, cache)
 
         # 9. Completado
         await db.actualizar_estado_pipeline(cliente_id, "completado")
         await cache.set_pipeline_status(cliente_id, "completado", paso=8, detalle="Pipeline finalizado")
-
-        # 10. Notificar via Telegram
-        await enviar_telegram(
-            f"✅ Pipeline completado para <b>{nombre_cliente}</b>\n"
-            f"Cliente ID: <code>{cliente_id}</code>"
-        )
 
         logger.info(f"Pipeline completado exitosamente para cliente={cliente_id}")
 

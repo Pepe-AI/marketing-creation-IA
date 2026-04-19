@@ -316,6 +316,48 @@ class DatabaseClient:
             )
             return self._row_to_dict(row) if row else None
 
+    async def actualizar_keyword_pytrends(
+        self, cliente_id: str, keyword: str,
+        interes_relativo: int, tendencia_12m: list,
+    ) -> Optional[dict]:
+        """Actualiza datos de pytrends (interés relativo + tendencia 12m) para una keyword."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                UPDATE keyword_research SET
+                    interes_relativo = $1,
+                    tendencia_12m = $2::jsonb
+                WHERE cliente_id = $3 AND keyword = $4
+                RETURNING *;
+            """,
+                interes_relativo,
+                json.dumps(tendencia_12m or [], ensure_ascii=False),
+                cliente_id,
+                keyword,
+            )
+            return self._row_to_dict(row) if row else None
+
+    async def actualizar_keyword_gemini_analysis(
+        self, cliente_id: str, keyword: str,
+        intencion_busqueda: str, analisis_serp_ia: str, fuente_volumen: str,
+    ) -> Optional[dict]:
+        """Actualiza análisis Gemini batch (intención + análisis SERP IA) para una keyword."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                UPDATE keyword_research SET
+                    intencion_busqueda = $1,
+                    analisis_serp_ia = $2,
+                    fuente_volumen = $3
+                WHERE cliente_id = $4 AND keyword = $5
+                RETURNING *;
+            """,
+                intencion_busqueda,
+                analisis_serp_ia,
+                fuente_volumen,
+                cliente_id,
+                keyword,
+            )
+            return self._row_to_dict(row) if row else None
+
     async def obtener_keywords(self, cliente_id: str) -> list[dict]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(

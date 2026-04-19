@@ -281,6 +281,52 @@ class RedisClient:
         except aioredis.RedisError:
             return []
 
+    # =================================================================
+    # CACHÉ: PYTRENDS (Google Trends por keyword)
+    # Key pattern: pytrends:{md5(keyword.lower())}
+    # TTL: 7 días
+    # =================================================================
+
+    def _pytrends_key(self, keyword: str) -> str:
+        return f"pytrends:{self._hash_key(keyword)}"
+
+    async def set_pytrends(self, keyword: str, datos: dict) -> bool:
+        """Cachea los datos de pytrends para una keyword (interés relativo + tendencia 12m)."""
+        payload = {
+            "keyword": keyword,
+            "datos": datos,
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return await self._set_json(self._pytrends_key(keyword), payload, TTL_CACHE_APIS)
+
+    async def get_pytrends(self, keyword: str) -> Optional[dict]:
+        """Obtiene datos cacheados de pytrends. None si no existe o expiró."""
+        result = await self._get_json(self._pytrends_key(keyword))
+        return result["datos"] if result else None
+
+    # =================================================================
+    # CACHÉ: GEMINI KEYWORD ANALYSIS (batch por cliente)
+    # Key pattern: gemini_kw_analysis:{cliente_id}
+    # TTL: 7 días
+    # =================================================================
+
+    def _gemini_kw_key(self, cliente_id: str) -> str:
+        return f"gemini_kw_analysis:{cliente_id}"
+
+    async def set_gemini_kw_analysis(self, cliente_id: str, datos: dict) -> bool:
+        """Cachea el análisis batch de Gemini de todas las keywords de un cliente."""
+        payload = {
+            "cliente_id": cliente_id,
+            "datos": datos,
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return await self._set_json(self._gemini_kw_key(cliente_id), payload, TTL_CACHE_APIS)
+
+    async def get_gemini_kw_analysis(self, cliente_id: str) -> Optional[dict]:
+        """Obtiene análisis de keywords cacheado. None si no existe o expiró."""
+        result = await self._get_json(self._gemini_kw_key(cliente_id))
+        return result["datos"] if result else None
+
     async def flush_cache(self, pattern: str = None) -> int:
         """Limpia keys de caché."""
         try:

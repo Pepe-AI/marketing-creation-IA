@@ -25,13 +25,14 @@ class AIProvider:
         context: str,
         instruction: str,
         timeout: int = 60,
+        max_output_tokens: int = 4096,
     ) -> str:
         """
         Genera texto usando el proveedor configurado.
         Retorna el texto de respuesta como string.
         """
         if self.provider == "gemini":
-            return await self._generate_gemini(system_prompt, context, instruction, timeout)
+            return await self._generate_gemini(system_prompt, context, instruction, timeout, max_output_tokens)
         elif self.provider in ("openai", "anthropic"):
             raise NotImplementedError(
                 f"Proveedor '{self.provider}' no implementado aún. Cambia AI_PROVIDER=gemini"
@@ -40,7 +41,8 @@ class AIProvider:
             raise ValueError(f"Proveedor de IA desconocido: '{self.provider}'")
 
     async def _generate_gemini(
-        self, system_prompt: str, context: str, instruction: str, timeout: int
+        self, system_prompt: str, context: str, instruction: str, timeout: int,
+        max_output_tokens: int = 4096,
     ) -> str:
         """Llamada a Gemini 2.5 Flash via REST API."""
         if not self.gemini_api_key:
@@ -65,7 +67,7 @@ class AIProvider:
             ],
             "generationConfig": {
                 "temperature": 0.3,
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": max_output_tokens,
             },
         }
 
