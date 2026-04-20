@@ -25,6 +25,10 @@ SCOPES = [
     "https://www.googleapis.com/auth/documents",
 ]
 
+# Email al que se transfiere ownership de los docs creados
+# para que cuenten contra su cuota (12 TB) y no la del Service Account (15 GB)
+DRIVE_OWNER_EMAIL = "javier@ecosfera.digital"
+
 # Títulos de las 9 secciones
 SECTION_TITLES = {
     1: "1. Análisis de Situación",
@@ -246,6 +250,24 @@ def _crear_google_doc(nombre_cliente: str, carpeta_drive_id: str, secciones: lis
             body={"requests": style_requests},
         ).execute()
         logger.info(f"Estilos aplicados: {len(style_requests)} párrafos formateados")
+
+    # 5. Transferir ownership a la cuenta principal de Ecosfera
+    #    Esto hace que el archivo cuente contra la cuota de javier@ecosfera.digital (12 TB)
+    #    en vez de los 15 GB del Service Account.
+    try:
+        drive_service.permissions().create(
+            fileId=document_id,
+            transferOwnership=True,
+            body={
+                "type": "user",
+                "role": "owner",
+                "emailAddress": DRIVE_OWNER_EMAIL,
+            },
+        ).execute()
+        logger.info(f"Ownership transferido a {DRIVE_OWNER_EMAIL}")
+    except Exception as e:
+        # No bloqueante — el doc ya existe y es accesible
+        logger.warning(f"No se pudo transferir ownership: {e}")
 
     return {"document_id": document_id, "web_view_link": web_view_link}
 
