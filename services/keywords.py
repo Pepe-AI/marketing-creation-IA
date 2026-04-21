@@ -200,7 +200,8 @@ async def gemini_batch_keywords(
                     "  ]\n"
                     "}"
                 ),
-                timeout=60,
+                timeout=90,
+                max_output_tokens=16384,  # 48 keywords × ~200 tokens c/u
             ),
             max_retries=2,
             base_delay=3.0,
